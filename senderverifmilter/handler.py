@@ -1,5 +1,8 @@
 import os
 
+# Postfix policy requests are small, this only prevents unbounded reads
+MAX_REQUEST_SIZE = 65536
+
 class Handler:
     """Handle request"""
 
@@ -19,9 +22,16 @@ class Handler:
 
     def handle(self) -> None:
         """Handle request"""
-        # Read data
-        # Attention: We only read first 2048 bytes, which is sufficient for our needs
-        self.data = self.conn.recv(2048).decode('utf-8')
+        # Read data until the empty line that ends a Postfix policy request
+        data = b''
+        while not data.endswith(b'\n\n'):
+            chunk = self.conn.recv(2048)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_REQUEST_SIZE:
+                raise Exception('Request too large')
+        self.data = data.decode('utf-8')
         if not self.data:
             raise Exception('No data received')
         #print('Received data:', self.data)
@@ -31,7 +41,7 @@ class Handler:
         request = {
             key: value
             for line in self.data.strip().split("\n")
-            for key, value in [line.strip().split('=', 1)] if value
+            for key, value in [line.strip().split('=', 1)]
         }
 
         # request['queue_id'],
@@ -48,6 +58,13 @@ class Handler:
         self.cursor = self.db.cursor()
 
         if 'sender' not in request:
+            # Postfix always sends the sender attribute, so the request is
+            # incomplete: it must not be handled as an empty sender.
+            print('INVALID request without sender:', request.get('client_address'))
+            self.send_response('REJECT')
+            return
+
+        if request['sender'] == '':
             # An empty sender is a valid value that we should allow, but only
             # in certain situations: we verify that the client address is
             # authorized by at least one domain.
